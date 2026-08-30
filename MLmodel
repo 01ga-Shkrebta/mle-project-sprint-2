@@ -1,0 +1,11 @@
+{
+  "flavors": {
+    "python_function": {
+      "model_path": "model.cb",
+      "loader_module": "pickle",
+      "python_version": "3.10",
+      "code": null
+    }
+  },
+  "artifact_path": "cv"
+}

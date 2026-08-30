@@ -1,0 +1,157 @@
+import os
+import optuna
+import pandas as pd
+import psycopg2
+import mlflow
+from catboost import CatBoostClassifier
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import confusion_matrix, roc_auc_score, precision_score, recall_score, f1_score
+from collections import defaultdict
+from optuna.integration.mlflow import MLflowCallback
+
+# ====== ЗАГРУЗКА ДАННЫХ ======
+connection = {
+    "sslmode": "require",
+    "target_session_attrs": "read-write",
+    "host": os.getenv("DB_DESTINATION_HOST"),
+    "port": os.getenv("DB_DESTINATION_PORT"),
+    "dbname": os.getenv("DB_DESTINATION_NAME"),
+    "user": os.getenv("DB_DESTINATION_USER"),
+    "password": os.getenv("DB_DESTINATION_PASSWORD"),
+}
+
+with psycopg2.connect(**connection) as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM users_churn")
+        data = cur.fetchall()
+        columns = [col[0] for col in cur.description]
+
+df = pd.DataFrame(data, columns=columns)
+
+# ====== РАЗДЕЛЬНАЯ ОБРАБОТКА ПРОПУСКОВ ======
+cat_columns_full = [
+    'type', 'paperless_billing', 'payment_method', 'internet_service',
+    'online_security', 'online_backup', 'device_protection', 'tech_support',
+    'streaming_tv', 'streaming_movies', 'gender', 'partner', 'dependents', 'multiple_lines'
+]
+
+num_columns_full = ['monthly_charges', 'total_charges', 'senior_citizen']
+
+for col in cat_columns_full:
+    df[col] = df[col].fillna("missing")
+
+for col in num_columns_full:
+    df[col] = df[col].fillna(df[col].median())
+
+# ====== ПРИЗНАКИ И ЦЕЛЕВАЯ ======
+X = df.drop(columns=['target', 'customer_id', 'begin_date', 'end_date'])
+y = df['target']
+
+# ====== РАЗБИЕНИЕ ======
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ====== MLflow ======
+os.environ["MLFLOW_S3_ENDPOINT_URL"] = "https://storage.yandexcloud.net"
+os.environ["AWS_ACCESS_KEY_ID"] = os.getenv("AWS_ACCESS_KEY_ID")
+os.environ["AWS_SECRET_ACCESS_KEY"] = os.getenv("AWS_SECRET_ACCESS_KEY")
+
+TRACKING_SERVER_HOST = "127.0.0.1"
+TRACKING_SERVER_PORT = 5000
+
+mlflow.set_tracking_uri(f"http://{TRACKING_SERVER_HOST}:{TRACKING_SERVER_PORT}")
+mlflow.set_registry_uri(f"http://{TRACKING_SERVER_HOST}:{TRACKING_SERVER_PORT}")
+
+EXPERIMENT_NAME = "churn_nikolaistepanov"
+RUN_NAME = "model_bayesian_search"
+
+STUDY_DB_NAME = "sqlite:///local.study.db"
+STUDY_NAME = "churn_model"
+
+# ====== CALLBACK ======
+mlflc = MLflowCallback(
+    tracking_uri="http://127.0.0.1:5000",
+    metric_name="auc",
+    mlflow_kwargs={
+        "experiment_name": EXPERIMENT_NAME,
+        "run_name": RUN_NAME
+    }
+)
+
+# ====== CATEGORICAL FEATURES (вынесены наружу) ======
+cat_features = cat_columns_full
+
+# ====== OBJECTIVE ======
+def objective(trial: optuna.Trial) -> float:
+    param = {
+        "learning_rate": trial.suggest_float("learning_rate", 0.001, 0.1, log=True),
+        "depth": trial.suggest_int("depth", 1, 12),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 5),
+        "random_strength": trial.suggest_float("random_strength", 0.1, 5),
+        "loss_function": "Logloss",
+        "task_type": "CPU",
+        "random_seed": 0,
+        "iterations": 300,
+        "verbose": False
+    }
+
+    model = CatBoostClassifier(**param)
+
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+    metrics = defaultdict(list)
+
+    for train_idx, val_idx in skf.split(X_train, y_train):
+        train_X, val_X = X_train.iloc[train_idx], X_train.iloc[val_idx]
+        train_y, val_y = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+        model.fit(train_X, train_y, cat_features=cat_features, eval_set=(val_X, val_y), verbose=False)
+
+        prediction = model.predict(val_X)
+        probas = model.predict_proba(val_X)[:, 1]
+
+        _, err1, _, err2 = confusion_matrix(val_y, prediction, normalize='all').ravel()
+        auc = roc_auc_score(val_y, probas)
+        precision = precision_score(val_y, prediction)
+        recall = recall_score(val_y, prediction)
+        f1 = f1_score(val_y, prediction)
+
+        metrics["err1"].append(err1)
+        metrics["err2"].append(err2)
+        metrics["auc"].append(auc)
+        metrics["precision"].append(precision)
+        metrics["recall"].append(recall)
+        metrics["f1"].append(f1)
+
+    err1 = sum(metrics["err1"]) / len(metrics["err1"])
+    err2 = sum(metrics["err2"]) / len(metrics["err2"])
+    auc = sum(metrics["auc"]) / len(metrics["auc"])
+    precision = sum(metrics["precision"]) / len(metrics["precision"])
+    recall = sum(metrics["recall"]) / len(metrics["recall"])
+    f1 = sum(metrics["f1"]) / len(metrics["f1"])
+
+    return auc
+
+# ====== STUDY ======
+sampler = optuna.samplers.TPESampler(seed=42)
+study = optuna.create_study(
+    study_name=STUDY_NAME,
+    storage=STUDY_DB_NAME,
+    sampler=sampler,
+    direction="maximize",
+    load_if_exists=True
+)
+
+study.optimize(objective, n_trials=10, callbacks=[mlflc])
+
+# ====== ЛУЧШАЯ МОДЕЛЬ ======
+best_params = study.best_params
+best_model = CatBoostClassifier(**best_params, loss_function="Logloss", task_type="CPU", random_seed=0, iterations=300, verbose=False)
+best_model.fit(X_train, y_train, cat_features=cat_features)
+
+# ====== ЛОГИРОВАНИЕ ======
+with mlflow.start_run(run_name=RUN_NAME, experiment_id=mlflow.get_experiment_by_name(EXPERIMENT_NAME).experiment_id) as run:
+    mlflow.log_params(best_params)
+    mlflow.catboost.log_model(best_model, artifact_path="models", registered_model_name="churn_model_nikolaistepanov")
+
+print("✅ Байесовская оптимизация завершена")
+print("Лучшие параметры:", best_params)
