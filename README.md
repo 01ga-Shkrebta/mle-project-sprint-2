@@ -34,3 +34,6 @@ pip install -r requirements.txt
 
 # 4. Запустить MLflow сервер
 ./mlflow_server/run_mlflow_server.sh
+
+# 5. Зарегистрировать модель в MLflow
+python mlflow_server/register_model.py
